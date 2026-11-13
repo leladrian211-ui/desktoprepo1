@@ -1,5 +1,6 @@
 name: Build Linux
 on: [workflow_dispatch, push]
+
 jobs:
   build-linux:
     runs-on: ubuntu-22.04
@@ -7,29 +8,98 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Install Linux & BoringSSL dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev cmake golang perl clang ninja-build
-      - name: Ensure BoringSSL vendor exists
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            pkg-config \
+            curl wget file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libasound2-dev \
+            libudev-dev \
+            libfuse2 \
+            patchelf \
+            cmake golang perl \
+            clang libclang-dev llvm-dev \
+            ninja-build
+
+      - name: Prepare exact BoringSSL from btls-sys 0.5.6
         run: |
-          if [ ! -d "vendor/boringssl" ]; then
-            ls -la scripts/ || true
-            for s in scripts/*.sh; do [ -f "$s" ] && bash "$s" || true; done
+          rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown || true
+          cargo fetch
+
+          BTLS_DIR=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -maxdepth 2 -type d -name "btls-sys-*" | head -n 1)
+          echo "Located btls-sys crate at: $BTLS_DIR"
+
+          rm -rf vendor/boringssl
+          mkdir -p vendor
+
+          if [ -n "$BTLS_DIR" ] && [ -f "$BTLS_DIR/deps/boringssl/CMakeLists.txt" ]; then
+            echo "Copying bundled BoringSSL from $BTLS_DIR/deps/boringssl..."
+            cp -r "$BTLS_DIR/deps/boringssl" vendor/boringssl
+          else
+            echo "Fallback: cloning exact btls v0.5.6 submodule..."
+            git clone --branch v0.5.6 --depth 1 --recurse-submodules https://github.com/0x676e67/btls.git /tmp/btls
+            cp -r /tmp/btls/btls-sys/deps/boringssl vendor/boringssl
+            BTLS_DIR="/tmp/btls/btls-sys"
           fi
-          if [ ! -d "vendor/boringssl" ]; then
-            mkdir -p vendor
-            git clone --depth 1 https://boringssl.googlesource.com/boringssl vendor/boringssl
-          fi
+
+          git -C vendor/boringssl init
+          git -C vendor/boringssl config user.email "ci@example.com"
+          git -C vendor/boringssl config user.name "CI"
+          git -C vendor/boringssl add -A
+          git -C vendor/boringssl commit -q -m "base"
+
+          # Apply btls-sys 0.5.6 patches first, then any repo patches
+          for patch_dir in "$BTLS_DIR/patches" "$PWD/patches"; do
+            if [ -d "$patch_dir" ]; then
+              for p in "$patch_dir"/*.patch; do
+                [ -f "$p" ] || continue
+                echo "Checking patch: $p"
+                if git -C vendor/boringssl apply --check --whitespace=nowarn "$p" 2>/dev/null; then
+                  echo "Applying with git apply: $p"
+                  git -C vendor/boringssl apply --whitespace=nowarn "$p"
+                elif patch -d vendor/boringssl -p1 --dry-run --forward -s < "$p" >/dev/null 2>&1; then
+                  echo "Applying with patch -p1: $p"
+                  patch -d vendor/boringssl -p1 --forward < "$p"
+                else
+                  echo "Skipping $p (already applied or not needed)"
+                fi
+              done
+            fi
+          done
+
+          rm -rf vendor/boringssl/.git
+
       - name: Install frontend & build Tauri
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
         run: |
           npm install
-          npm run tauri build
+          npm run tauri build || npx tauri build --no-bundle
+
+      - name: Collect built Linux packages
+        run: |
+          mkdir -p dist-linux
+          find target/release/bundle src-tauri/target/release/bundle -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp -v {} dist-linux/ \; 2>/dev/null || true
+          find target/release src-tauri/target/release -maxdepth 1 -type f -executable ! -name "*.so" ! -name "*.d" -exec cp -v {} dist-linux/ \; 2>/dev/null || true
+          ls -lh dist-linux/
+
       - uses: actions/upload-artifact@v4
         with:
           name: anilili-linux
-          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          path: dist-linux/*
